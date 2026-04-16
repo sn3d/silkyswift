@@ -30,3 +30,9 @@ go.work.sum
 # Editor/IDE
 # .idea/
 # .vscode/
+
+# Generated CA material at the repo root (anchored so internal/ca/ is not matched).
+/ca.crt
+/ca.key
+/recs/
+
