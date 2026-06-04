@@ -11,15 +11,14 @@ recordings to disk. Stdlib only, zero external dependencies.
 
 ## Install
 
-Download the latest binary from
-[Releases](https://github.com/sn3d/silkyswift/releases/latest), or build
-from source:
+For installation, you could use `brew`:
 
-```bash
-git clone https://github.com/sn3d/silkyswift.git
-cd silkyswift
-go build -o silkyswift .
 ```
+brew install sn3d/tap/silkyswift
+```
+
+You you can download binary for you system [here](https://github.com/sn3d/silkyswift/releases)
+
 
 ## Run
 
