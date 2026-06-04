@@ -19,8 +19,8 @@ import (
 	"github.com/sn3d/silkyswift/internal/recorder"
 )
 
-// version is set by goreleaser, via -ldflags="-X 'main.version=...'".
-var version = "development"
+// version is set by goreleaser, via -ldflags="-X main.version=...".
+var version = "dev"
 
 func main() {
 	var (
@@ -31,7 +31,7 @@ func main() {
 	flag.Parse()
 
 	if *showVersion {
-		fmt.Println(version)
+		fmt.Printf("silkyswift version %s\n", version)
 		return
 	}
 

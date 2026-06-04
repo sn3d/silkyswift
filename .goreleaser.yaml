@@ -15,21 +15,20 @@ builds:
       - windows
     goarch:
       - amd64
-      - arm
       - arm64
-    ignore:
-      - goos: windows
-        goarch: arm
-      - goos: darwin
-        goarch: arm
     ldflags:
-      - -s -w -X 'main.version={{.Version}}'
+      - -s -w -X main.version={{.Version}}
 
 archives:
   - name_template: '{{ .ProjectName }}_{{ if eq .Os "darwin" }}macOS{{ else }}{{ .Os }}{{ end }}_{{ .Arch }}'
+    formats:
+      - tar.gz
     format_overrides:
       - goos: windows
-        format: zip
+        formats:
+          - zip
+    files:
+      - README*
 
 checksum:
   name_template: 'checksums.txt'
@@ -45,3 +44,17 @@ changelog:
 
 release:
   name_template: '{{ .ProjectName }}-v{{ .Version }}'
+
+brews:
+  - name: silkyswift
+    repository:
+      owner: sn3d
+      name: homebrew-tap
+      token: "{{ .Env.HOMEBREW_TAP_GITHUB_TOKEN }}"
+    directory: Formula
+    homepage: "https://github.com/sn3d/silkyswift"
+    description: "Minimal CONNECT-tunnel HTTPS intercepting proxy that records api.anthropic.com traffic"
+    install: |
+      bin.install "silkyswift"
+    test: |
+      system "#{bin}/silkyswift", "--version"

@@ -1,0 +1,29 @@
+name: build
+on:
+  push:
+    branches:
+      - '**'
+    tags-ignore:
+      - '**'
+  pull_request:
+
+jobs:
+  build:
+    name: Build & Test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: 'go.mod'
+          cache: true
+
+      - name: Install tparse
+        run: go install github.com/mfridman/tparse@latest
+
+      - name: Test
+        run: go test -json -race -count=1 ./... | tparse -all
+
+      - name: Build
+        run: go build -o ./bin/silkyswift ./main.go
