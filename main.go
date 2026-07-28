@@ -12,11 +12,13 @@ import (
 	"os/signal"
 	"path/filepath"
 	"runtime"
+	"strings"
 	"syscall"
 
 	"github.com/sn3d/silkyswift/internal/ca"
 	"github.com/sn3d/silkyswift/internal/proxy"
 	"github.com/sn3d/silkyswift/internal/recorder"
+	"github.com/sn3d/silkyswift/internal/sample"
 )
 
 // version is set by goreleaser, via -ldflags="-X main.version=...".
@@ -24,15 +26,21 @@ var version = "dev"
 
 func main() {
 	var (
-		listenAddr  = flag.String("listen", "127.0.0.1:8080", "proxy listen address")
-		recordDir   = flag.String("record", "", "if set, record api.anthropic.com/v1/* pairs to DIR")
-		showVersion = flag.Bool("version", false, "print version and exit")
+		listenAddr   = flag.String("listen", "127.0.0.1:8080", "proxy listen address")
+		recordDir    = flag.String("record", "", "if set, record api.anthropic.com/v1/* pairs to DIR")
+		recordFormat = flag.String("record-format", "raw", "recording format: raw | messages | both")
+		showVersion  = flag.Bool("version", false, "print version and exit")
 	)
 	flag.Parse()
 
 	if *showVersion {
 		fmt.Printf("silkyswift version %s\n", version)
 		return
+	}
+
+	rawEnabled, sampleEnabled, err := parseRecordFormat(*recordFormat)
+	if err != nil {
+		fatal("record-format", err)
 	}
 
 	slog.SetDefault(slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{
@@ -49,21 +57,54 @@ func main() {
 		caPath = "ca.crt"
 	}
 
-	var rec *recorder.Recorder
+	// A recording format was requested but no output directory given: fail
+	// loudly rather than silently record nothing.
+	if *recordDir == "" && *recordFormat != "raw" {
+		fatal("record-format", fmt.Errorf("--record-format=%s requires --record DIR", *recordFormat))
+	}
+
+	var (
+		rec  *recorder.Recorder
+		srec *sample.SampleRecorder
+	)
 	if *recordDir != "" {
-		rec, err = recorder.New(*recordDir)
-		if err != nil {
-			fatal("recorder", err)
+		if rawEnabled {
+			rec, err = recorder.New(*recordDir)
+			if err != nil {
+				fatal("recorder", err)
+			}
+		}
+		if sampleEnabled {
+			srec, err = sample.New(*recordDir)
+			if err != nil {
+				fatal("sample recorder", err)
+			}
 		}
 	}
 
-	printBanner(caPath, *listenAddr, rec)
+	printBanner(caPath, *listenAddr, *recordDir, rawEnabled, sampleEnabled)
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
-	if err := proxy.Serve(ctx, *listenAddr, authority, rec); err != nil {
+	if err := proxy.Serve(ctx, *listenAddr, authority, rec, srec); err != nil {
 		fatal("proxy", err)
+	}
+}
+
+// parseRecordFormat maps the --record-format value to which outputs are
+// enabled. "raw" writes wire-format .txt pairs; "messages" writes fine-tuning
+// .json samples; "both" writes both.
+func parseRecordFormat(f string) (raw, sample bool, err error) {
+	switch f {
+	case "raw":
+		return true, false, nil
+	case "messages":
+		return false, true, nil
+	case "both":
+		return true, true, nil
+	default:
+		return false, false, fmt.Errorf("invalid value %q (want raw|messages|both)", f)
 	}
 }
 
@@ -108,7 +149,7 @@ func isTerminal(f *os.File) bool {
 	return fi.Mode()&os.ModeCharDevice != 0
 }
 
-func printBanner(caPath, listenAddr string, rec *recorder.Recorder) {
+func printBanner(caPath, listenAddr, recordDir string, rawEnabled, sampleEnabled bool) {
 	s := newStyle()
 	w := os.Stderr
 
@@ -119,9 +160,16 @@ func printBanner(caPath, listenAddr string, rec *recorder.Recorder) {
 	fmt.Fprintf(w, "  %s🔌 Listening%s   http://%s\n", s.bold, s.reset, listenAddr)
 	fmt.Fprintf(w, "  %s📜 CA cert%s     %s %s(reused across runs)%s\n",
 		s.bold, s.reset, caPath, s.dim, s.reset)
-	if rec != nil {
-		fmt.Fprintf(w, "  %s🎙  Recording%s   %s %s(api.anthropic.com/v1/*)%s\n",
-			s.bold, s.reset, rec.Dir(), s.dim, s.reset)
+	if recordDir != "" && (rawEnabled || sampleEnabled) {
+		var formats []string
+		if rawEnabled {
+			formats = append(formats, "raw .txt")
+		}
+		if sampleEnabled {
+			formats = append(formats, "messages .json")
+		}
+		fmt.Fprintf(w, "  %s🎙  Recording%s   %s %s(%s · api.anthropic.com/v1/*)%s\n",
+			s.bold, s.reset, recordDir, s.dim, strings.Join(formats, " + "), s.reset)
 	} else {
 		fmt.Fprintf(w, "  %s🎙  Recording%s   disabled %s(pass --record DIR to enable)%s\n",
 			s.bold, s.reset, s.dim, s.reset)

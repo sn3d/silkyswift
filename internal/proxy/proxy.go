@@ -24,13 +24,17 @@ import (
 
 	"github.com/sn3d/silkyswift/internal/ca"
 	"github.com/sn3d/silkyswift/internal/recorder"
+	"github.com/sn3d/silkyswift/internal/sample"
 )
 
 const (
 	recordedHost       = "api.anthropic.com"
 	recordedPathPrefix = "/v1/"
+	// messagesPath is the only endpoint that yields a fine-tuning sample; other
+	// /v1/* calls (mcp_servers, count_tokens, ...) are raw-recorded only.
+	messagesPath = "/v1/messages"
 
-	connectReadTimeout = 10 * time.Second
+	connectReadTimeout  = 10 * time.Second
 	tlsHandshakeTimeout = 10 * time.Second
 )
 
@@ -52,7 +56,7 @@ var requestCounter atomic.Uint64
 
 // Serve binds to addr and accepts CONNECT requests until ctx is cancelled.
 // rec may be nil (no recording).
-func Serve(ctx context.Context, addr string, authority *ca.Authority, rec *recorder.Recorder) error {
+func Serve(ctx context.Context, addr string, authority *ca.Authority, rec *recorder.Recorder, srec *sample.SampleRecorder) error {
 	var lc net.ListenConfig
 	ln, err := lc.Listen(ctx, "tcp", addr)
 	if err != nil {
@@ -80,11 +84,11 @@ func Serve(ctx context.Context, addr string, authority *ca.Authority, rec *recor
 			slog.Warn("accept error", "err", err)
 			continue
 		}
-		go handleConn(conn, authority, rec, transport)
+		go handleConn(conn, authority, rec, srec, transport)
 	}
 }
 
-func handleConn(conn net.Conn, authority *ca.Authority, rec *recorder.Recorder, transport *http.Transport) {
+func handleConn(conn net.Conn, authority *ca.Authority, rec *recorder.Recorder, srec *sample.SampleRecorder, transport *http.Transport) {
 	defer conn.Close()
 
 	// Bound the CONNECT-read phase so slow clients can't tie up goroutines.
@@ -132,7 +136,7 @@ func handleConn(conn net.Conn, authority *ca.Authority, rec *recorder.Recorder, 
 	defer tlsConn.Close()
 
 	srv := &http.Server{
-		Handler:           proxyHandler(domain, rec, transport),
+		Handler:           proxyHandler(domain, rec, srec, transport),
 		ReadHeaderTimeout: 10 * time.Second,
 		IdleTimeout:       60 * time.Second,
 		ErrorLog:          log.New(io.Discard, "", 0),
@@ -143,7 +147,7 @@ func handleConn(conn net.Conn, authority *ca.Authority, rec *recorder.Recorder, 
 	_ = srv.Serve(newSingleConnListener(tlsConn))
 }
 
-func proxyHandler(domain string, rec *recorder.Recorder, transport *http.Transport) http.Handler {
+func proxyHandler(domain string, rec *recorder.Recorder, srec *sample.SampleRecorder, transport *http.Transport) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		reqID := requestCounter.Add(1)
 
@@ -159,11 +163,31 @@ func proxyHandler(domain string, rec *recorder.Recorder, transport *http.Transpo
 			_ = r.Body.Close()
 		}
 
-		shouldRecord := rec != nil && domain == recordedHost && strings.HasPrefix(r.URL.Path, recordedPathPrefix)
+		// A recorded endpoint is api.anthropic.com/v1/*. Raw and sample
+		// recording are independent outputs; either being enabled recruits
+		// the request into recording.
+		isRecordedEndpoint := domain == recordedHost && strings.HasPrefix(r.URL.Path, recordedPathPrefix)
+		recordRaw := rec != nil && isRecordedEndpoint
+		// Samples are only meaningful for the Messages endpoint; other /v1/*
+		// calls carry no conversation to fine-tune on.
+		recordSample := srec != nil && domain == recordedHost && r.URL.Path == messagesPath
+		shouldRecord := recordRaw || recordSample
 
-		var prefix string
+		var (
+			prefix  string
+			reqTime time.Time
+		)
 		if shouldRecord {
-			prefix = rec.MakePrefix(reqID, time.Now())
+			reqTime = time.Now()
+			// Prefix scheme is owned by the raw recorder; reuse it when present
+			// so raw .txt and .json share a prefix, else derive it locally.
+			if rec != nil {
+				prefix = rec.MakePrefix(reqID, reqTime)
+			} else {
+				prefix = makePrefix(reqID, reqTime)
+			}
+		}
+		if recordRaw {
 			// Fire request recording off-thread so disk I/O can't block forwarding.
 			go rec.WriteRequest(
 				prefix,
@@ -225,7 +249,7 @@ func proxyHandler(domain string, rec *recorder.Recorder, transport *http.Transpo
 		//   - Non-SSE without recording: pure passthrough (io.Copy).
 		if isSSE {
 			var recFile *os.File
-			if shouldRecord {
+			if recordRaw {
 				f, err := rec.OpenResponseFile(prefix)
 				if err != nil {
 					slog.Warn("open response file", "err", err)
@@ -243,7 +267,17 @@ func proxyHandler(domain string, rec *recorder.Recorder, transport *http.Transpo
 					}()
 				}
 			}
-			streamResponse(w, resp, recFile)
+			var assembler *sample.Assembler
+			if recordSample {
+				assembler = sample.NewAssembler()
+			}
+			streamResponse(w, resp, recFile, assembler)
+			if recordSample {
+				msg, truncated := assembler.Done()
+				// Record off-thread so parse/marshal/disk I/O stay off the
+				// forwarding path.
+				go srec.Record(prefix, reqTime, bodyBytes, msg, truncated)
+			}
 			return
 		}
 
@@ -252,9 +286,18 @@ func proxyHandler(domain string, rec *recorder.Recorder, transport *http.Transpo
 			if err != nil {
 				slog.Warn("read upstream body", "err", err)
 			}
-			// Pass upstream headers verbatim (hop-by-hop included) to the
-			// recorder; the client-facing copy above is already filtered.
-			go rec.WriteResponse(prefix, resp.Proto, resp.StatusCode, resp.Header.Clone(), body)
+			if recordRaw {
+				// Pass upstream headers verbatim (hop-by-hop included) to the
+				// recorder; the client-facing copy above is already filtered.
+				go rec.WriteResponse(prefix, resp.Proto, resp.StatusCode, resp.Header.Clone(), body)
+			}
+			if recordSample {
+				msg, ok := sample.AssembleJSON(body)
+				if !ok {
+					msg = nil
+				}
+				go srec.Record(prefix, reqTime, bodyBytes, msg, false)
+			}
 			w.WriteHeader(resp.StatusCode)
 			_, _ = w.Write(body)
 			return
@@ -270,7 +313,7 @@ func proxyHandler(domain string, rec *recorder.Recorder, transport *http.Transpo
 // each chunk is also written to the open recording file. On a client-write
 // error, an SSE-comment truncation marker is appended to the recording so
 // partial captures are self-describing.
-func streamResponse(w http.ResponseWriter, resp *http.Response, recFile *os.File) {
+func streamResponse(w http.ResponseWriter, resp *http.Response, recFile *os.File, assembler *sample.Assembler) {
 	w.WriteHeader(resp.StatusCode)
 	flusher, ok := w.(http.Flusher)
 	if !ok {
@@ -286,12 +329,18 @@ func streamResponse(w http.ResponseWriter, resp *http.Response, recFile *os.File
 				if recFile != nil {
 					appendTruncationMarker(recFile, err.Error())
 				}
+				if assembler != nil {
+					assembler.Truncate()
+				}
 				return
 			}
 			if recFile != nil {
 				if _, err := recFile.Write(chunk); err != nil {
 					slog.Warn("write chunk to recording", "err", err)
 				}
+			}
+			if assembler != nil {
+				assembler.Write(chunk)
 			}
 			if flusher != nil {
 				flusher.Flush()
@@ -301,9 +350,23 @@ func streamResponse(w http.ResponseWriter, resp *http.Response, recFile *os.File
 			if !errors.Is(readErr, io.EOF) && recFile != nil {
 				appendTruncationMarker(recFile, readErr.Error())
 			}
+			if !errors.Is(readErr, io.EOF) && assembler != nil {
+				assembler.Truncate()
+			}
 			return
 		}
 	}
+}
+
+// makePrefix builds the recorder prefix scheme locally for the sample-only
+// path where no raw recorder is present to own it. Mirrors recorder.MakePrefix.
+func makePrefix(id uint64, t time.Time) string {
+	u := t.UTC()
+	return fmt.Sprintf("%s%03d_%05d",
+		u.Format("20060102-150405"),
+		u.Nanosecond()/int(time.Millisecond),
+		id,
+	)
 }
 
 func appendTruncationMarker(f *os.File, msg string) {
