@@ -1,8 +1,11 @@
 // Package proxy implements a CONNECT-tunnel HTTPS intercepting proxy. For
-// every accepted connection we parse one HTTP/1.1 CONNECT request, upgrade
-// the raw TCP socket to TLS using a per-SNI leaf cert minted by the CA,
-// and serve the decrypted traffic through an http.Server. Requests to
-// api.anthropic.com/v1/* are recorded when a *recorder.Recorder is supplied.
+// every accepted connection we parse one HTTP/1.1 request. A CONNECT upgrades
+// the raw TCP socket to TLS using a per-SNI leaf cert minted by the CA and
+// serves the decrypted traffic through an http.Server. Any other method is a
+// plain-HTTP proxy request (absolute-form request-URI, e.g. a local http://
+// MCP server routed through HTTPS_PROXY) and is forwarded transparently.
+// Requests to api.anthropic.com/v1/* are recorded when a *recorder.Recorder
+// is supplied; plain-HTTP is never the recorded endpoint.
 package proxy
 
 import (
@@ -101,8 +104,13 @@ func handleConn(conn net.Conn, authority *ca.Authority, rec *recorder.Recorder, 
 	}
 
 	if req.Method != http.MethodConnect {
-		// This proxy only supports CONNECT (HTTPS). Reject plain-HTTP proxying.
-		_, _ = fmt.Fprint(conn, "HTTP/1.1 405 Method Not Allowed\r\nContent-Length: 0\r\n\r\n")
+		// Plain-HTTP proxy request (absolute-form request-URI, e.g. a local
+		// http:// MCP server routed through HTTPS_PROXY). These are never the
+		// recorded api.anthropic.com/v1/* endpoint (that arrives over CONNECT+TLS),
+		// so forward transparently without recording. Clear the CONNECT-phase
+		// deadline first; the plain-HTTP server sets its own timeouts.
+		_ = conn.SetReadDeadline(time.Time{})
+		serveHTTP(conn, br, req, transport)
 		return
 	}
 
@@ -145,6 +153,82 @@ func handleConn(conn net.Conn, authority *ca.Authority, rec *recorder.Recorder, 
 	// single-conn listener is closed after the first accept so http.Server
 	// shuts down cleanly when the TLS conn closes.
 	_ = srv.Serve(newSingleConnListener(tlsConn))
+}
+
+// serveHTTP transparently forwards plain-HTTP proxy requests (absolute-form
+// request-URI) over the same client connection, honoring HTTP/1.1 keep-alive.
+// req is the first already-parsed request; further requests are read from br.
+// No TLS, no recording — plain-HTTP is never the recorded endpoint.
+//
+// Like the CONNECT path, this forwards to any host the client names, which
+// includes internal/link-local targets (cloud metadata, RFC1918). That open
+// relay is only safe because the proxy is meant to bind loopback; do not
+// expose the listener on a non-loopback address without an allowlist.
+func serveHTTP(conn net.Conn, br *bufio.Reader, req *http.Request, transport *http.Transport) {
+	for {
+		keepAlive := forwardHTTPRequest(conn, req, transport)
+		if !keepAlive {
+			return
+		}
+		_ = conn.SetReadDeadline(time.Now().Add(60 * time.Second))
+		next, err := http.ReadRequest(br)
+		if err != nil {
+			return
+		}
+		_ = conn.SetReadDeadline(time.Time{})
+		req = next
+	}
+}
+
+// forwardHTTPRequest proxies a single plain-HTTP request upstream and writes
+// the response back to conn. It reports whether the connection may be reused
+// for a subsequent keep-alive request.
+func forwardHTTPRequest(conn net.Conn, req *http.Request, transport *http.Transport) bool {
+	// Absolute-form request-URI carries the target; a proxy request without one
+	// is malformed for our purposes.
+	if req.URL == nil || req.URL.Host == "" {
+		_, _ = io.WriteString(conn, "HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+		return false
+	}
+
+	// Capture the client's keep-alive intent before we reshape the request;
+	// req.Close is reset below for the outbound hop.
+	clientWantsClose := req.Close
+
+	// Reshape the parsed server request into a client request the transport
+	// accepts: RoundTrip rejects a non-empty RequestURI, and RequestURI/Close
+	// carry no meaning outbound. Stream req.Body straight through (no buffering)
+	// and keep req.URL verbatim so the target's path/query aren't re-encoded.
+	defer req.Body.Close()
+	req.RequestURI = ""
+	req.Close = false
+	for k := range req.Header {
+		if isHopByHop(k) {
+			req.Header.Del(k)
+		}
+	}
+
+	resp, err := transport.RoundTrip(req)
+	if err != nil {
+		slog.Warn("plain-http roundtrip error", "err", err)
+		_, _ = io.WriteString(conn, "HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+		return false
+	}
+	defer resp.Body.Close()
+
+	// Strip hop-by-hop headers on the client-facing copy, mirroring the CONNECT path.
+	for k := range resp.Header {
+		if isHopByHop(k) {
+			resp.Header.Del(k)
+		}
+	}
+
+	if err := resp.Write(conn); err != nil {
+		return false
+	}
+	// resp.Write emits Connection: close semantics faithfully; reuse the conn
+	// only when neither side asked to close.
+	return !clientWantsClose && !resp.Close
 }
 
 func proxyHandler(domain string, rec *recorder.Recorder, srec *sample.SampleRecorder, transport *http.Transport) http.Handler {

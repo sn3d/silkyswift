@@ -1,19 +1,24 @@
 package proxy
 
 import (
+	"bufio"
 	"context"
 	"crypto/tls"
 	"crypto/x509"
 	"encoding/json"
+	"io"
 	"net"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
+	"github.com/sn3d/silkyswift/internal/ca"
 	"github.com/sn3d/silkyswift/internal/recorder"
 	"github.com/sn3d/silkyswift/internal/sample"
 )
@@ -214,6 +219,170 @@ func TestProxyHandler_EndToEnd(t *testing.T) {
 
 	t.Logf("E2E OK: model=%s messages=%d tools=%d sample=%dB",
 		s.Model, len(s.Messages), len(s.Tools), len(data))
+}
+
+// TestServe_PlainHTTPPassthrough covers the regression where a plain-HTTP
+// client routed through HTTPS_PROXY (e.g. a local http:// MCP server) was
+// rejected with 405. The proxy must transparently forward such requests.
+func TestServe_PlainHTTPPassthrough(t *testing.T) {
+	// A plain-HTTP upstream standing in for a localhost MCP server.
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/tidewave/mcp" {
+			w.WriteHeader(http.StatusNotFound)
+			return
+		}
+		w.Header().Set("X-From-Upstream", "yes")
+		_, _ = w.Write([]byte("mcp-ok"))
+	}))
+	defer upstream.Close()
+
+	caDir := t.TempDir()
+	authority, err := ca.LoadOrGenerate(filepath.Join(caDir, "ca.crt"), filepath.Join(caDir, "ca.key"))
+	if err != nil {
+		t.Fatalf("ca.LoadOrGenerate: %v", err)
+	}
+
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+
+	// Bind an ephemeral port and run the real Serve loop (no recorders).
+	ln, err := (&net.ListenConfig{}).Listen(ctx, "tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	proxyAddr := ln.Addr().String()
+	_ = ln.Close()
+
+	go func() { _ = Serve(ctx, proxyAddr, authority, nil, nil) }()
+
+	// Poll until the proxy is accepting.
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		c, derr := net.Dial("tcp", proxyAddr)
+		if derr == nil {
+			_ = c.Close()
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+
+	// Drive a plain-HTTP proxy request just as an HTTPS_PROXY-aware client would:
+	// absolute-form request-URI to the http:// upstream, sent to the proxy socket.
+	conn, err := net.Dial("tcp", proxyAddr)
+	if err != nil {
+		t.Fatalf("dial proxy: %v", err)
+	}
+	defer conn.Close()
+	_ = conn.SetDeadline(time.Now().Add(5 * time.Second))
+
+	target := upstream.URL + "/tidewave/mcp"
+	host := strings.TrimPrefix(upstream.URL, "http://")
+	reqLine := "GET " + target + " HTTP/1.1\r\nHost: " + host + "\r\nConnection: close\r\n\r\n"
+	if _, err := conn.Write([]byte(reqLine)); err != nil {
+		t.Fatalf("write request: %v", err)
+	}
+
+	resp, err := http.ReadResponse(bufio.NewReader(conn), nil)
+	if err != nil {
+		t.Fatalf("read response: %v", err)
+	}
+	defer resp.Body.Close()
+	body, _ := io.ReadAll(resp.Body)
+
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want 200", resp.StatusCode)
+	}
+	if resp.Header.Get("X-From-Upstream") != "yes" {
+		t.Errorf("missing upstream header; got %v", resp.Header)
+	}
+	if string(body) != "mcp-ok" {
+		t.Errorf("body = %q, want mcp-ok", body)
+	}
+}
+
+// TestServe_PlainHTTPKeepAlive exercises the keep-alive loop in serveHTTP:
+// two sequential plain-HTTP requests on one client connection must both be
+// forwarded and answered, proving the loop reuses the socket rather than
+// hanging or closing after the first response.
+func TestServe_PlainHTTPKeepAlive(t *testing.T) {
+	var hits int32
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		n := atomic.AddInt32(&hits, 1)
+		_, _ = io.WriteString(w, "reply-"+strconv.Itoa(int(n)))
+	}))
+	defer upstream.Close()
+
+	caDir := t.TempDir()
+	authority, err := ca.LoadOrGenerate(filepath.Join(caDir, "ca.crt"), filepath.Join(caDir, "ca.key"))
+	if err != nil {
+		t.Fatalf("ca.LoadOrGenerate: %v", err)
+	}
+
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+
+	ln, err := (&net.ListenConfig{}).Listen(ctx, "tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	proxyAddr := ln.Addr().String()
+	_ = ln.Close()
+
+	go func() { _ = Serve(ctx, proxyAddr, authority, nil, nil) }()
+
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		c, derr := net.Dial("tcp", proxyAddr)
+		if derr == nil {
+			_ = c.Close()
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+
+	conn, err := net.Dial("tcp", proxyAddr)
+	if err != nil {
+		t.Fatalf("dial proxy: %v", err)
+	}
+	defer conn.Close()
+	_ = conn.SetDeadline(time.Now().Add(5 * time.Second))
+
+	host := strings.TrimPrefix(upstream.URL, "http://")
+	br := bufio.NewReader(conn)
+
+	// First request: keep-alive (no Connection: close).
+	req1 := "GET " + upstream.URL + "/a HTTP/1.1\r\nHost: " + host + "\r\n\r\n"
+	if _, err := conn.Write([]byte(req1)); err != nil {
+		t.Fatalf("write req1: %v", err)
+	}
+	resp1, err := http.ReadResponse(br, nil)
+	if err != nil {
+		t.Fatalf("read resp1: %v", err)
+	}
+	body1, _ := io.ReadAll(resp1.Body)
+	_ = resp1.Body.Close()
+	if string(body1) != "reply-1" {
+		t.Fatalf("resp1 body = %q, want reply-1", body1)
+	}
+
+	// Second request on the SAME connection must be served by the keep-alive loop.
+	req2 := "GET " + upstream.URL + "/b HTTP/1.1\r\nHost: " + host + "\r\nConnection: close\r\n\r\n"
+	if _, err := conn.Write([]byte(req2)); err != nil {
+		t.Fatalf("write req2: %v", err)
+	}
+	resp2, err := http.ReadResponse(br, nil)
+	if err != nil {
+		t.Fatalf("read resp2 (keep-alive loop failed to serve 2nd request): %v", err)
+	}
+	body2, _ := io.ReadAll(resp2.Body)
+	_ = resp2.Body.Close()
+	if string(body2) != "reply-2" {
+		t.Fatalf("resp2 body = %q, want reply-2", body2)
+	}
+
+	if got := atomic.LoadInt32(&hits); got != 2 {
+		t.Errorf("upstream hits = %d, want 2", got)
+	}
 }
 
 func roles(msgs []sample.Message) []string {
